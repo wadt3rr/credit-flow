@@ -98,6 +98,396 @@ func TestClaimBatch(t *testing.T) {
 
 }
 
+func TestClaimBatchSkipsPendingEventBeforeNextAttempt(t *testing.T) {
+	pool := newTestPool(t)
+	cleanOutbox(t, pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	event := insertOutboxEvent(t, ctx, pool)
+
+	_, err := pool.Exec(ctx, `
+		UPDATE outbox_events
+		SET next_attempt_at = NOW() + INTERVAL '1 hour'
+		WHERE id = $1
+	`, event.ID)
+	if err != nil {
+		t.Fatalf("update next_attempt_at: %v", err)
+	}
+
+	repository := NewOutboxRepository(pool)
+
+	events, err := repository.ClaimBatch(ctx, uuid.NewV7())
+	if err != nil {
+		t.Fatalf("claim batch: %v", err)
+	}
+
+	if len(events) != 0 {
+		t.Fatalf("expected no events, got: %d", len(events))
+	}
+
+	var status string
+	var attempts int32
+
+	err = pool.QueryRow(ctx, `
+		SELECT status, attempts
+		FROM outbox_events
+		WHERE id = $1
+	`, event.ID).Scan(&status, &attempts)
+	if err != nil {
+		t.Fatalf("scan outbox event: %v", err)
+	}
+
+	if status != "pending" {
+		t.Fatalf("expected status pending, got: %s", status)
+	}
+
+	if attempts != 0 {
+		t.Fatalf("expected 0 attempts, got: %d", attempts)
+	}
+}
+
+func TestClaimBatchReclaimsExpiredLease(t *testing.T) {
+	pool := newTestPool(t)
+	cleanOutbox(t, pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	event := insertOutboxEvent(t, ctx, pool)
+
+	repository := NewOutboxRepository(pool)
+
+	publisherAID := uuid.NewV7()
+	publisherBID := uuid.NewV7()
+
+	events, err := repository.ClaimBatch(ctx, publisherAID)
+	if err != nil {
+		t.Fatalf("claim batch: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, `UPDATE outbox_events SET locked_until = NOW() - INTERVAL '40 seconds' WHERE id = $1`, event.ID)
+	if err != nil {
+		t.Fatalf("update locked_intil: %v", err)
+	}
+
+	events, err = repository.ClaimBatch(ctx, publisherBID)
+	if err != nil {
+		t.Fatalf("reclaim batch: %v", err)
+	}
+
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got: %d", len(events))
+	}
+
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got: %d", len(events))
+	}
+
+	if events[0].ID != event.ID {
+		t.Fatalf("expected equal IDs, got %s != %s", events[0].ID, event.ID)
+	}
+
+	if events[0].Attempts != 2 {
+		t.Fatalf("expected 2 attempts, got: %d", events[0].Attempts)
+	}
+
+	row := pool.QueryRow(ctx, `SELECT locked_by, locked_until, published_at, status FROM outbox_events WHERE id = $1`, event.ID)
+
+	var lockedBy uuid.UUID
+	var lockedUntil, publishedAt pgtype.Timestamptz
+	var status string
+
+	if err := row.Scan(&lockedBy, &lockedUntil, &publishedAt, &status); err != nil {
+		t.Fatalf("scan outbox event: %v", err)
+	}
+
+	if lockedBy != publisherBID {
+		t.Fatalf("expected lock by: %s, got: %s", publisherBID, lockedBy)
+	}
+
+	if !lockedUntil.Valid {
+		t.Fatal("expected locked_until to be set")
+	}
+
+	if publishedAt.Valid {
+		t.Fatal("expected published_at to be NULL")
+	}
+
+	if status != "claimed" {
+		t.Fatalf("expected status claimed, got: %q", status)
+	}
+
+}
+
+func TestClaimBatchSkipsPublishedEvents(t *testing.T) {
+	pool := newTestPool(t)
+	cleanOutbox(t, pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	event := insertOutboxEvent(t, ctx, pool)
+
+	repository := NewOutboxRepository(pool)
+
+	publisherID := uuid.NewV7()
+
+	// Захватываем событие.
+	events, err := repository.ClaimBatch(ctx, publisherID)
+	if err != nil {
+		t.Fatalf("claim batch: %v", err)
+	}
+
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got: %d", len(events))
+	}
+
+	// Помечаем событие как опубликованное.
+	if err := repository.MarkPublished(ctx, event.ID, publisherID); err != nil {
+		t.Fatalf("mark published: %v", err)
+	}
+
+	// Пытаемся получить события повторно.
+	events, err = repository.ClaimBatch(ctx, uuid.NewV7())
+	if err != nil {
+		t.Fatalf("claim batch after publishing: %v", err)
+	}
+
+	if len(events) != 0 {
+		t.Fatalf("expected no events, got: %d", len(events))
+	}
+
+	// Проверяем состояние записи непосредственно в БД.
+	var (
+		status      string
+		attempts    int32
+		publishedAt pgtype.Timestamptz
+		lockedBy    pgtype.UUID
+		lockedUntil pgtype.Timestamptz
+	)
+
+	err = pool.QueryRow(ctx, `
+		SELECT status, attempts, published_at, locked_by, locked_until
+		FROM outbox_events
+		WHERE id = $1
+	`, event.ID).Scan(
+		&status,
+		&attempts,
+		&publishedAt,
+		&lockedBy,
+		&lockedUntil,
+	)
+	if err != nil {
+		t.Fatalf("scan outbox event: %v", err)
+	}
+
+	if status != "published" {
+		t.Fatalf("expected status published, got: %q", status)
+	}
+
+	if attempts != 1 {
+		t.Fatalf("expected 1 attempt, got: %d", attempts)
+	}
+
+	if !publishedAt.Valid {
+		t.Fatal("expected published_at to be set")
+	}
+
+	if lockedBy.Valid {
+		t.Fatal("expected locked_by to be NULL")
+	}
+
+	if lockedUntil.Valid {
+		t.Fatal("expected locked_until to be NULL")
+	}
+}
+
+func TestClaimBatchMovesPendingEventToFailed(t *testing.T) {
+	pool := newTestPool(t)
+	cleanOutbox(t, pool)
+
+	ctx := context.Background()
+	event := insertOutboxEvent(t, ctx, pool)
+
+	_, err := pool.Exec(ctx, `
+        UPDATE outbox_events
+        SET attempts = 10
+        WHERE id = $1
+    `, event.ID)
+	if err != nil {
+		t.Fatalf("set attempts: %v", err)
+	}
+
+	publisherID := uuid.NewV7()
+	repo := NewOutboxRepository(pool)
+
+	events, err := repo.ClaimBatch(ctx, publisherID)
+	if err != nil {
+		t.Fatalf("claim batch: %v", err)
+	}
+
+	if len(events) != 0 {
+		t.Fatalf("expected no events, got %d", len(events))
+	}
+
+	var status string
+	var attempts int32
+	var lockedByIsNull, lockedUntilIsNull bool
+
+	err = pool.QueryRow(ctx, `
+        SELECT status, attempts,
+               locked_by IS NULL,
+               locked_until IS NULL
+        FROM outbox_events
+        WHERE id = $1
+    `, event.ID).Scan(
+		&status,
+		&attempts,
+		&lockedByIsNull,
+		&lockedUntilIsNull,
+	)
+	if err != nil {
+		t.Fatalf("get event: %v", err)
+	}
+
+	if status != "failed" {
+		t.Errorf("expected status failed, got %s", status)
+	}
+	if attempts != 10 {
+		t.Errorf("expected attempts 10, got %d", attempts)
+	}
+	if !lockedByIsNull || !lockedUntilIsNull {
+		t.Error("expected lease fields to be NULL")
+	}
+}
+
+func TestClaimBatchMovesExpiredClaimedEventToFailed(t *testing.T) {
+	pool := newTestPool(t)
+	cleanOutbox(t, pool)
+
+	ctx := context.Background()
+	event := insertOutboxEvent(t, ctx, pool)
+
+	previousPublisherID := uuid.NewV7()
+
+	_, err := pool.Exec(ctx, `
+        UPDATE outbox_events
+        SET
+            status = 'claimed',
+            attempts = 10,
+            locked_by = $2,
+            locked_until = NOW() - INTERVAL '1 minute'
+        WHERE id = $1
+    `, event.ID, previousPublisherID)
+	if err != nil {
+		t.Fatalf("prepare event: %v", err)
+	}
+
+	publisherID := uuid.NewV7()
+	repo := NewOutboxRepository(pool)
+
+	events, err := repo.ClaimBatch(ctx, publisherID)
+	if err != nil {
+		t.Fatalf("claim batch: %v", err)
+	}
+
+	if len(events) != 0 {
+		t.Fatalf("expected no events, got %d", len(events))
+	}
+
+	var status string
+	var attempts int32
+	var lockedByIsNull, lockedUntilIsNull bool
+
+	err = pool.QueryRow(ctx, `
+        SELECT status, attempts,
+               locked_by IS NULL,
+               locked_until IS NULL
+        FROM outbox_events
+        WHERE id = $1
+    `, event.ID).Scan(
+		&status,
+		&attempts,
+		&lockedByIsNull,
+		&lockedUntilIsNull,
+	)
+	if err != nil {
+		t.Fatalf("get event: %v", err)
+	}
+
+	if status != "failed" {
+		t.Errorf("expected status failed, got %s", status)
+	}
+	if attempts != 10 {
+		t.Errorf("expected attempts 10, got %d", attempts)
+	}
+	if !lockedByIsNull || !lockedUntilIsNull {
+		t.Error("expected lease fields to be NULL")
+	}
+}
+
+func TestClaimBatchAllowsLastAttempt(t *testing.T) {
+	pool := newTestPool(t)
+	cleanOutbox(t, pool)
+
+	ctx := context.Background()
+	event := insertOutboxEvent(t, ctx, pool)
+
+	_, err := pool.Exec(ctx, `
+        UPDATE outbox_events
+        SET attempts = 9
+        WHERE id = $1
+    `, event.ID)
+	if err != nil {
+		t.Fatalf("set attempts: %v", err)
+	}
+
+	publisherID := uuid.NewV7()
+	repo := NewOutboxRepository(pool)
+
+	events, err := repo.ClaimBatch(ctx, publisherID)
+	if err != nil {
+		t.Fatalf("claim batch: %v", err)
+	}
+
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	if events[0].ID != event.ID {
+		t.Errorf("expected event %s, got %s", event.ID, events[0].ID)
+	}
+
+	if events[0].Attempts != 10 {
+		t.Errorf("expected attempts 10, got %d", events[0].Attempts)
+	}
+
+	var status string
+	var lockedBy uuid.UUID
+	var lockedUntilIsNull bool
+
+	err = pool.QueryRow(ctx, `
+        SELECT status, locked_by, locked_until IS NULL
+        FROM outbox_events
+        WHERE id = $1
+    `, event.ID).Scan(&status, &lockedBy, &lockedUntilIsNull)
+	if err != nil {
+		t.Fatalf("get event: %v", err)
+	}
+
+	if status != "claimed" {
+		t.Errorf("expected status claimed, got %s", status)
+	}
+	if lockedBy != publisherID {
+		t.Errorf("expected publisher %s, got %s", publisherID, lockedBy)
+	}
+	if lockedUntilIsNull {
+		t.Error("expected locked_until to be set")
+	}
+}
+
 func TestMarkPublished(t *testing.T) {
 	pool := newTestPool(t)
 	cleanOutbox(t, pool)

@@ -9,6 +9,8 @@ import (
 	"github.com/wadt3rr/credit-flow/services/application/internal/domain"
 )
 
+const maxOutboxAttempts = 10
+
 type OutboxRepository struct {
 	pool *pgxpool.Pool
 }
@@ -28,32 +30,66 @@ func (r *OutboxRepository) ClaimBatch(ctx context.Context, publisherID uuid.UUID
 	defer tx.Rollback(ctx)
 
 	query := `
-		WITH picked_events AS (
-		SELECT id
-		FROM outbox_events
-		WHERE published_at IS NULL
-		AND (
-			locked_until IS NULL
-			OR locked_until <= NOW()
+		WITH exhausted_events AS (
+			SELECT id
+			FROM outbox_events
+			WHERE
+				attempts >= 10
+				AND (
+					status = 'pending'
+					OR (
+						status = 'claimed'
+						AND locked_until <= NOW()
+					)
+				)
+			FOR UPDATE SKIP LOCKED
+		),
+		marked_as_failed AS (
+			UPDATE outbox_events AS o
+			SET
+				status = 'failed',
+				locked_by = NULL,
+				locked_until = NULL
+			FROM exhausted_events AS e
+			WHERE o.id = e.id
+			RETURNING o.id
+		),
+		events_to_claim AS (
+			SELECT id
+			FROM outbox_events
+			WHERE
+				attempts < 10
+				AND (
+					(
+						status = 'pending'
+						AND next_attempt_at <= NOW()
+					)
+					OR (
+						status = 'claimed'
+						AND locked_until <= NOW()
+					)
+				)
+			ORDER BY created_at ASC, id ASC
+			LIMIT 100
+			FOR UPDATE SKIP LOCKED
 		)
-		ORDER BY created_at ASC
-		LIMIT 100
-		FOR UPDATE SKIP LOCKED
-	)
-	UPDATE outbox_events AS o
-	SET
-		locked_by = $1,
-		locked_until = NOW() + INTERVAL '30 seconds',
-		attempts = attempts + 1
-	FROM picked_events AS p
-	WHERE o.id = p.id
-	RETURNING
-		o.id,
-		o.aggregate_type,
-		o.aggregate_id,
-		o.event_type,
-		o.payload,
-		o.attempts;
+		UPDATE outbox_events AS o
+		SET
+			status = 'claimed',
+			locked_by = $1,
+			locked_until = NOW() + INTERVAL '30 seconds',
+			attempts = o.attempts + 1
+		FROM events_to_claim AS e
+		WHERE o.id = e.id
+		RETURNING
+			o.id,
+			o.aggregate_type,
+			o.aggregate_id,
+			o.event_type,
+			o.payload,
+			o.attempts
+		;
+	
 	`
 
 	rows, err := tx.Query(ctx, query, publisherID)
@@ -99,6 +135,7 @@ func (r *OutboxRepository) MarkPublished(ctx context.Context, eventID uuid.UUID,
 	query := `
 		UPDATE outbox_events
 		SET
+			status = 'published',
 			published_at = NOW(),
 			locked_by = NULL,
 			locked_until = NULL
@@ -126,6 +163,7 @@ func (r *OutboxRepository) ReleaseClaim(ctx context.Context, eventID uuid.UUID, 
 	query := `
 		UPDATE outbox_events
 		SET
+			status = 'pending',
 			last_error = $3,
 			locked_by = NULL,
 			locked_until = NULL
