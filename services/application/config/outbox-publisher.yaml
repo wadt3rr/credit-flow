@@ -1,0 +1,15 @@
+postgres:
+  host: localhost
+  port: 5432
+  user: credit_flow
+  password: ""
+  database: application_db
+  ssl_mode: disable
+
+kafka:
+  brokers:
+    - localhost:9094
+  topic: application.events
+
+outbox:
+  poll_interval: 1s
