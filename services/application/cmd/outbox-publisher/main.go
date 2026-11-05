@@ -47,7 +47,10 @@ func run() error {
 
 	repository := repo.NewOutboxRepository(pool)
 
-	producer := kafka.NewProducer(cfg.Kafka.Brokers, cfg.Kafka.Topic)
+	producer, err := kafka.NewProducer(cfg.Kafka.Brokers, cfg.Kafka.Topic)
+	if err != nil {
+		return fmt.Errorf("create producer: %w", err)
+	}
 	defer func() {
 		if err := producer.Close(); err != nil {
 			slog.Error("close kafka producer", "error", err)

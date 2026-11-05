@@ -5,18 +5,28 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: credit_flow
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${APP_POSTGRES_PASSWORD}
       POSTGRES_DB: application_db
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql\
+      - postgres_data:/var/lib/postgresql
   kafka:
     image: apache/kafka:4.1.1
     container_name: credit-flow-kafka
     restart: unless-stopped
     ports:
       - "9094:9094"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller

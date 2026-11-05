@@ -2,7 +2,9 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -16,16 +18,37 @@ type Message struct {
 	Value []byte
 }
 
-func NewProducer(brokers []string, topic string) *Producer {
+func NewProducer(brokers []string, topic string) (*Producer, error) {
+	if len(brokers) == 0 {
+		return nil, errors.New("brokers list must not be empty")
+	}
+
+	normalizedBrokers := make([]string, 0, len(brokers))
+
+	for _, broker := range brokers {
+		broker = strings.TrimSpace(broker)
+		if broker == "" {
+			return nil, errors.New("broker address must not be empty")
+		}
+
+		normalizedBrokers = append(normalizedBrokers, broker)
+	}
+
+	topic = strings.TrimSpace(topic)
+
+	if topic == "" {
+		return nil, errors.New("topic must not be empty")
+	}
+
 	return &Producer{
 		writer: &kafka.Writer{
-			Addr:         kafka.TCP(brokers...),
+			Addr:         kafka.TCP(normalizedBrokers...),
 			Topic:        topic,
 			Balancer:     &kafka.Hash{},
 			RequiredAcks: kafka.RequireAll,
 			Async:        false,
 		},
-	}
+	}, nil
 }
 
 func (p *Producer) Publish(ctx context.Context, messages ...Message) error {

@@ -12,9 +12,10 @@ var _ OutboxRepository = (*MockOutboxRepository)(nil)
 var _ EventProducer = (*MockEventProducer)(nil)
 
 type MockEventProducer struct {
-	Messages []kafka.Message
-	Errors   []error
-	Calls    int
+	Messages    []kafka.Message
+	Errors      []error
+	Calls       int
+	PublishFunc func(context.Context, ...kafka.Message) error
 }
 
 type MockOutboxRepository struct {
@@ -29,20 +30,27 @@ type MockOutboxRepository struct {
 	ReleasedEvents     []uuid.UUID
 
 	ClaimNotifications chan struct{}
+	ReleaseFunc        func(
+		context.Context,
+		uuid.UUID,
+		uuid.UUID,
+		error,
+	) error
 }
 
 func (p *MockEventProducer) Publish(ctx context.Context, messages ...kafka.Message) error {
 	p.Messages = append(p.Messages, messages...)
+	p.Calls++
 
-	if p.Calls >= len(p.Errors) {
-		p.Calls++
+	if p.PublishFunc != nil {
+		return p.PublishFunc(ctx, messages...)
+	}
+
+	if p.Calls > len(p.Errors) {
 		return nil
 	}
 
-	err := p.Errors[p.Calls]
-	p.Calls++
-
-	return err
+	return p.Errors[p.Calls-1]
 }
 
 func (r *MockOutboxRepository) ClaimBatch(
@@ -69,6 +77,10 @@ func (r *MockOutboxRepository) MarkPublished(ctx context.Context, eventID uuid.U
 
 func (r *MockOutboxRepository) ReleaseClaim(ctx context.Context, eventID uuid.UUID, publisherID uuid.UUID, publishErr error) error {
 	r.ReleasedEvents = append(r.ReleasedEvents, eventID)
+
+	if r.ReleaseFunc != nil {
+		return r.ReleaseFunc(ctx, eventID, publisherID, publishErr)
+	}
 
 	return r.ReleaseErr
 }

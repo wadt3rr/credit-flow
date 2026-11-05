@@ -60,20 +60,40 @@ func (p *OutboxPublisher) ProcessBatch(ctx context.Context) error {
 	var batchErr error
 
 	for _, event := range batch {
+		if err := ctx.Err(); err != nil {
+			batchErr = errors.Join(batchErr, err)
+			break
+		}
 		message := kafka.Message{
 			Key:   event.AggregateID[:],
 			Value: event.Payload,
 		}
 
 		if err := p.producer.Publish(ctx, message); err != nil {
-			if releaseErr := p.repository.ReleaseClaim(ctx, event.ID, p.publisherID, err); releaseErr != nil {
+			releaseCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(ctx),
+				5*time.Second,
+			)
+
+			releaseErr := p.repository.ReleaseClaim(
+				releaseCtx,
+				event.ID,
+				p.publisherID,
+				err,
+			)
+			cancel()
+
+			if releaseErr != nil {
 				batchErr = errors.Join(
 					batchErr,
 					fmt.Errorf("release event %s: %w", event.ID, releaseErr),
 				)
 			}
 
-			batchErr = errors.Join(batchErr, fmt.Errorf("publish event %s: %w", event.ID, err))
+			batchErr = errors.Join(
+				batchErr,
+				fmt.Errorf("publish event %s: %w", event.ID, err),
+			)
 			continue
 		}
 
@@ -87,7 +107,10 @@ func (p *OutboxPublisher) ProcessBatch(ctx context.Context) error {
 }
 
 func (p *OutboxPublisher) Run(ctx context.Context, interval time.Duration) error {
-	const op = "internal.application.outbox_publisher.Run"
+	const (
+		op           = "internal.application.outbox_publisher.Run"
+		batchTimeout = 30 * time.Second
+	)
 	if interval <= 0 {
 		return fmt.Errorf("%s: interval must be positive", op)
 	}
@@ -100,11 +123,12 @@ func (p *OutboxPublisher) Run(ctx context.Context, interval time.Duration) error
 			return nil
 		}
 
-		if err := p.ProcessBatch(ctx); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
+		batchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), batchTimeout)
 
+		err := p.ProcessBatch(batchCtx)
+		cancel()
+
+		if err != nil {
 			slog.Error(
 				"process outbox batch",
 				"publisher_id", p.publisherID,

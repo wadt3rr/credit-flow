@@ -10,6 +10,7 @@ import (
 	"uuid"
 
 	"github.com/wadt3rr/credit-flow/services/application/internal/domain"
+	"github.com/wadt3rr/credit-flow/services/application/internal/infrastructure/kafka"
 )
 
 func TestProcessBatchSuccess(t *testing.T) {
@@ -446,5 +447,182 @@ func TestRunContinuesAfterProcessBatchError(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Run did not stop after context cancellation")
+	}
+}
+
+func TestProcessBatchStopsAfterContextCancellation(t *testing.T) {
+	events := []domain.OutboxEvent{
+		{ID: uuid.NewV7(), AggregateID: uuid.NewV7()},
+		{ID: uuid.NewV7(), AggregateID: uuid.NewV7()},
+		{ID: uuid.NewV7(), AggregateID: uuid.NewV7()},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	producer := &MockEventProducer{
+		PublishFunc: func(ctx context.Context, _ ...kafka.Message) error {
+			cancel()
+			return ctx.Err()
+		},
+	}
+
+	repository := &MockOutboxRepository{
+		Events: events,
+	}
+
+	publisher, err := NewOutboxPublisher(repository, producer)
+	if err != nil {
+		t.Fatalf("create publisher: %v", err)
+	}
+
+	err = publisher.ProcessBatch(ctx)
+	if err == nil {
+		t.Fatal("expected error after context cancellation")
+	}
+
+	if producer.Calls != 1 {
+		t.Fatalf("expected 1 publish call, got %d", producer.Calls)
+	}
+
+	if len(repository.ReleasedEvents) != 1 {
+		t.Fatalf("expected 1 released event, got %d", len(repository.ReleasedEvents))
+	}
+
+	if repository.ReleasedEvents[0] != events[0].ID {
+		t.Fatal("unexpected released event")
+	}
+
+	if len(repository.MarkedEvents) != 0 {
+		t.Fatalf("expected 0 marked events, got %d", len(repository.MarkedEvents))
+	}
+}
+
+func TestProcessBatchReleaseClaimWithIndependentContext(t *testing.T) {
+	event := domain.OutboxEvent{
+		ID:          uuid.NewV7(),
+		AggregateID: uuid.NewV7(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	repository := &MockOutboxRepository{
+		Events: []domain.OutboxEvent{event},
+		ReleaseFunc: func(
+			releaseCtx context.Context,
+			_ uuid.UUID,
+			_ uuid.UUID,
+			_ error,
+		) error {
+			if err := releaseCtx.Err(); err != nil {
+				t.Fatalf("release context unexpectedly cancelled: %v", err)
+			}
+
+			if _, ok := releaseCtx.Deadline(); !ok {
+				t.Fatal("expected release context deadline")
+			}
+
+			return nil
+		},
+	}
+
+	producer := &MockEventProducer{
+		PublishFunc: func(ctx context.Context, _ ...kafka.Message) error {
+			cancel()
+			return ctx.Err()
+		},
+	}
+
+	publisher, err := NewOutboxPublisher(repository, producer)
+	if err != nil {
+		t.Fatalf("create publisher: %v", err)
+	}
+
+	err = publisher.ProcessBatch(ctx)
+	if err == nil {
+		t.Fatal("expected publish error")
+	}
+
+	if len(repository.ReleasedEvents) != 1 {
+		t.Fatalf("expected 1 released event, got %d", len(repository.ReleasedEvents))
+	}
+}
+
+func TestRunWaitsForCurrentBatchOnCancellation(t *testing.T) {
+	event := domain.OutboxEvent{
+		ID:          uuid.NewV7(),
+		AggregateID: uuid.NewV7(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	publishStarted := make(chan struct{})
+	allowPublish := make(chan struct{})
+
+	producer := &MockEventProducer{
+		PublishFunc: func(ctx context.Context, _ ...kafka.Message) error {
+			close(publishStarted)
+			<-allowPublish
+			return nil
+		},
+	}
+
+	repository := &MockOutboxRepository{
+		Events: []domain.OutboxEvent{event},
+	}
+
+	publisher, err := NewOutboxPublisher(repository, producer)
+	if err != nil {
+		t.Fatalf("create publisher: %v", err)
+	}
+
+	runDone := make(chan error, 1)
+
+	go func() {
+		runDone <- publisher.Run(ctx, time.Hour)
+	}()
+
+	select {
+	case <-publishStarted:
+	case <-time.After(time.Second):
+		t.Fatal("publisher did not start publishing")
+	}
+
+	cancel()
+
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run returned before batch completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(allowPublish)
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after batch completion")
+	}
+
+	if producer.Calls != 1 {
+		t.Errorf("expected 1 publish call, got %d", producer.Calls)
+	}
+
+	if len(repository.MarkedEvents) != 1 {
+		t.Errorf("expected 1 marked event, got %d", len(repository.MarkedEvents))
+	}
+
+	if repository.MarkedEvents[0] != event.ID {
+		t.Errorf("unexpected marked event ID: got %s, want %s",
+			repository.MarkedEvents[0], event.ID)
+	}
+
+	if len(repository.ReleasedEvents) != 0 {
+		t.Errorf("expected no released events, got %d", len(repository.ReleasedEvents))
 	}
 }
