@@ -13,6 +13,8 @@ import (
 	"unicode/utf8"
 	"uuid"
 
+	"github.com/wadt3rr/credit-flow/services/application/internal/application"
+	"github.com/wadt3rr/credit-flow/services/application/internal/applicationtx"
 	"github.com/wadt3rr/credit-flow/services/application/internal/domain"
 )
 
@@ -59,13 +61,6 @@ type IdempotencyRepository interface {
 	) (bool, error)
 }
 
-type TransactionManager interface {
-	WithinTransaction(
-		ctx context.Context,
-		fn func(ctx context.Context) error,
-	) error
-}
-
 type ApplicationRepository interface {
 	Create(ctx context.Context, app domain.Application) (domain.Application, error)
 }
@@ -78,14 +73,14 @@ type CreateApplication struct {
 	applications ApplicationRepository
 	history      ApplicationHistoryRepository
 	idempotency  IdempotencyRepository
-	txManager    TransactionManager
+	txManager    applicationtx.TransactionManager
 }
 
 func NewCreateApplication(
 	applications ApplicationRepository,
 	history ApplicationHistoryRepository,
 	idempotency IdempotencyRepository,
-	txManager TransactionManager,
+	txManager applicationtx.TransactionManager,
 ) *CreateApplication {
 	return &CreateApplication{
 		applications: applications,
@@ -205,7 +200,7 @@ func (c *CreateApplication) Execute(ctx context.Context, input CreateApplication
 		}
 
 		if !created {
-			return ErrIdempotencyRecordAlreadyExists
+			return application.ErrIdempotencyRecordAlreadyExists
 		}
 
 		output = CreateApplicationOutput{
@@ -217,7 +212,7 @@ func (c *CreateApplication) Execute(ctx context.Context, input CreateApplication
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, ErrIdempotencyRecordAlreadyExists) {
+		if errors.Is(err, application.ErrIdempotencyRecordAlreadyExists) {
 			resp, lookupErr := c.findIdempotentResponse(ctx, input, reqHash)
 			if lookupErr != nil {
 				return nil, fmt.Errorf("find concurrent idempotent response: %w", lookupErr)
@@ -317,23 +312,23 @@ func (c *CreateApplication) findIdempotentResponse(
 	}
 
 	if record.RequestHash != requestHash {
-		return nil, ErrIdempotencyKeyConflict
+		return nil, application.ErrIdempotencyKeyConflict
 	}
 
 	if !time.Now().Before(record.ExpiresAt) {
-		return nil, ErrIdempotencyResponseExpired
+		return nil, application.ErrIdempotencyResponseExpired
 	}
 
 	if record.ResponseStatus == nil {
-		return nil, ErrIdempotencyResponseExpired
+		return nil, application.ErrIdempotencyResponseExpired
 	}
 
 	if record.ResponseHeaders == nil {
-		return nil, ErrIdempotencyResponseExpired
+		return nil, application.ErrIdempotencyResponseExpired
 	}
 
 	if record.ResponseBody == nil {
-		return nil, ErrIdempotencyResponseExpired
+		return nil, application.ErrIdempotencyResponseExpired
 	}
 
 	var headers map[string]string

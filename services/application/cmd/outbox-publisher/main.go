@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/wadt3rr/credit-flow/services/application/config"
-	"github.com/wadt3rr/credit-flow/services/application/internal/application"
 	"github.com/wadt3rr/credit-flow/services/application/internal/infrastructure/kafka"
 	"github.com/wadt3rr/credit-flow/services/application/internal/infrastructure/postgres"
+	"github.com/wadt3rr/credit-flow/services/application/internal/outbox"
 	repo "github.com/wadt3rr/credit-flow/services/application/internal/repository/postgres"
 )
 
@@ -57,7 +57,7 @@ func run() error {
 		}
 	}()
 
-	publisher, err := application.NewOutboxPublisher(repository, producer)
+	publisher, err := outbox.NewOutboxPublisher(repository, producer)
 	if err != nil {
 		return fmt.Errorf("create outbox publisher: %w", err)
 	}

@@ -7,16 +7,16 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/wadt3rr/credit-flow/services/application/internal/application"
+	"github.com/wadt3rr/credit-flow/services/application/internal/applicationtx"
 )
 
 type transactionManager struct {
 	pool *pgxpool.Pool
 }
 
-var _ application.TransactionManager = (*transactionManager)(nil)
+var _ applicationtx.TransactionManager = (*transactionManager)(nil)
 
-func NewTransactionManager(pool *pgxpool.Pool) application.TransactionManager {
+func NewTransactionManager(pool *pgxpool.Pool) applicationtx.TransactionManager {
 	return &transactionManager{
 		pool: pool,
 	}

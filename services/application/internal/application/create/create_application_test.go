@@ -10,6 +10,7 @@ import (
 	"uuid"
 
 	"github.com/stretchr/testify/require"
+	"github.com/wadt3rr/credit-flow/services/application/internal/application"
 	"github.com/wadt3rr/credit-flow/services/application/internal/domain"
 )
 
@@ -349,7 +350,7 @@ func TestCreateApplication_Execute_IdempotencyKeyConflict(t *testing.T) {
 
 	output, err := useCase.Execute(context.Background(), input)
 
-	require.ErrorIs(t, err, ErrIdempotencyKeyConflict)
+	require.ErrorIs(t, err, application.ErrIdempotencyKeyConflict)
 	require.Nil(t, output)
 
 	require.Equal(t, 1, idempotencyRepo.getCalls)
