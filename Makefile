@@ -97,6 +97,18 @@ migrate-down: ## Roll back last application migration
 migrate-status: ## Show application migration status
 	$(GOOSE) -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" status
 
+.PHONY: test-migrate-up
+test-migrate-up: ## Apply application migrations test db
+	$(GOOSE) -dir $(MIGRATIONS_DIR) postgres "$(TEST_DATABASE_URL)" up
+
+.PHONY: test-migrate-down
+test-migrate-down: ## Roll back last application migration test db
+	$(GOOSE) -dir $(MIGRATIONS_DIR) postgres "$(TEST_DATABASE_URL)" down
+
+.PHONY: test-migrate-status
+test-migrate-status: ## Show application migration status test db
+	$(GOOSE) -dir $(MIGRATIONS_DIR) postgres "$(TEST_DATABASE_URL)" status
+
 .PHONY: migrate-create
 migrate-create: ## Create migration (usage: make migrate-create NAME=add_example)
 	@test -n "$(NAME)" || (echo "Usage: make migrate-create NAME=migration_name"; exit 1)
